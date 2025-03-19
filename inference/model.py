@@ -134,16 +134,16 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
 
     Args:
         x (torch.Tensor): The input tensor.
-        weight (torch.Tensor): The weight tensor. It may be quantized and 
+        weight (torch.Tensor): The weight tensor. It may be quantized and
             requires dequantization for certain cases.
         bias (Optional[torch.Tensor]): The bias tensor to be added. Default is None.
 
     Returns:
-        torch.Tensor: The result of the linear transformation, which may involve 
+        torch.Tensor: The result of the linear transformation, which may involve
         quantization-aware computations depending on the input parameters.
 
     Notes:
-        - If `weight` is quantized (e.g., `element_size() == 1`), a dequantized version 
+        - If `weight` is quantized (e.g., `element_size() == 1`), a dequantized version
           is used for computation.
         - If `gemm_impl == "bf16"`, dequantization and a `bf16` GEMM operation are applied.
         - For other cases, the function applies quantization to `x` and uses `fp8_gemm` for computation.
@@ -419,25 +419,30 @@ class MLA(nn.Module):
         self.v_head_dim = args.v_head_dim
 
         if self.q_lora_rank == 0:
-            self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim)
+            self.wq = ColumnParallelLinear(self.dim, self.n_heads * self.qk_head_dim) # [7168, 128*192=24576]
         else:
-            self.wq_a = Linear(self.dim, self.q_lora_rank)
+            self.wq_a = Linear(self.dim, self.q_lora_rank) # [7168, 1536]
             self.q_norm = RMSNorm(self.q_lora_rank)
-            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
-        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim)
+            self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.qk_head_dim) # [1536, 128*192=24576]
+        self.wkv_a = Linear(self.dim, self.kv_lora_rank + self.qk_rope_head_dim) # dim=7168, kv_lora_rank=512, qk_rope_head_dim=64
         self.kv_norm = RMSNorm(self.kv_lora_rank)
+
+        # kv_lora_rank=512, n_heads=128, qk_nope_head_dim=128, v_head_dim=128
         self.wkv_b = ColumnParallelLinear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim)
+        self.wo = RowParallelLinear(self.n_heads * self.v_head_dim, self.dim) # [128*128=16384, 7168]
         self.softmax_scale = self.qk_head_dim ** -0.5
         if args.max_seq_len > args.original_seq_len:
             mscale = 0.1 * args.mscale * math.log(args.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
 
         if attn_impl == "naive":
+            # bs, seq_len, 128, 192
             self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
             self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
         else:
+            # bs, seq_len=32, kv_lora_rank=512
             self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.kv_lora_rank), persistent=False)
+            # bs, seq_len=32, qk_rope_head_dim=64
             self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.qk_rope_head_dim), persistent=False)
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]):
@@ -459,29 +464,30 @@ class MLA(nn.Module):
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe = apply_rotary_emb(q_pe, freqs_cis)
-        kv = self.wkv_a(x)
-        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
+        q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim) # [1, 32, 128, 192]
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1) # [1, 32, 128, 128][1, 32, 128, 64]
+        q_pe = apply_rotary_emb(q_pe, freqs_cis) # [1, 32, 128, 64]
+        kv = self.wkv_a(x) # [1, 32, 576], x.shape=[1, 32, 7168]
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1) # [1, 32, 512][1, 32, 64]
+        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis) # [1, 32, 1, 64]
         if attn_impl == "naive":
-            q = torch.cat([q_nope, q_pe], dim=-1)
-            kv = self.wkv_b(self.kv_norm(kv))
-            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
-            self.k_cache[:bsz, start_pos:end_pos] = k
-            self.v_cache[:bsz, start_pos:end_pos] = v
-            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale
+            q = torch.cat([q_nope, q_pe], dim=-1) # [1, 32, 128, 192]
+            kv = self.wkv_b(self.kv_norm(kv)) # [1, 32, 32768]
+            kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim) # [1, 32, 128, 256]
+            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1) # [1, 32, 128, 128][1, 32, 128, 128]
+            k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1) # [1, 32, 128, 192]
+            self.k_cache[:bsz, start_pos:end_pos] = k # [1, 32, 128, 192]
+            self.v_cache[:bsz, start_pos:end_pos] = v # [1, 32, 128, 128]
+            scores = torch.einsum("bshd,bthd->bsht", q, self.k_cache[:bsz, :end_pos]) * self.softmax_scale # [1, 32, 128, 128]
         else:
-            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size) 
-            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
-            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
-            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv)
-            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
+            # self.wkv_b.weight: [32768, 512]
+            wkv_b = self.wkv_b.weight if self.wkv_b.scale is None else weight_dequant(self.wkv_b.weight, self.wkv_b.scale, block_size)
+            wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank) # [128, 256, 512]
+            q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim]) # [1, 32, 128, 512]
+            self.kv_cache[:bsz, start_pos:end_pos] = self.kv_norm(kv) # [1, 32, 512]
+            self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2) # [1, 32, 64]
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
-                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
+                      torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale # [1, 32, 128, 128]
         if mask is not None:
             scores += mask.unsqueeze(1)
         scores = scores.softmax(dim=-1, dtype=torch.float32).type_as(x)
@@ -489,8 +495,8 @@ class MLA(nn.Module):
             x = torch.einsum("bsht,bthd->bshd", scores, self.v_cache[:bsz, :end_pos])
         else:
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
-            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
-        x = self.wo(x.flatten(2))
+            x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:]) # [1, 32, 128, 128]
+        x = self.wo(x.flatten(2)) # [1, 32, 7168]
         return x
 
 
@@ -581,14 +587,14 @@ class Gate(nn.Module):
         if self.n_groups > 1:
             scores = scores.view(x.size(0), self.n_groups, -1)
             if self.bias is None:
-                group_scores = scores.amax(dim=-1)
+                group_scores = scores.amax(dim=-1) # 每行的最大值[最后一个维度为行]
             else:
                 group_scores = scores.topk(2, dim=-1)[0].sum(dim=-1)
-            indices = group_scores.topk(self.topk_groups, dim=-1)[1]
-            mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False)
-            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1)
-        indices = torch.topk(scores, self.topk, dim=-1)[1]
-        weights = original_scores.gather(1, indices)
+            indices = group_scores.topk(self.topk_groups, dim=-1)[1] # topk_groups个topk的索引
+            mask = scores.new_ones(x.size(0), self.n_groups, dtype=bool).scatter_(1, indices, False) # 在[x.size(0), n_groups]范围内将topk索引位置置为False
+            scores = scores.masked_fill_(mask.unsqueeze(-1), float("-inf")).flatten(1) # 将scores中不是topk值(mask为True)所在的行置为负无穷[最后一个维度为行]
+        indices = torch.topk(scores, self.topk, dim=-1)[1] # 重新获取topk的索引，这时不再考虑非topk值所在行的影响[最后一个维度为行]
+        weights = original_scores.gather(1, indices) # 按索引gather数据
         if self.score_func == "sigmoid":
             weights /= weights.sum(dim=-1, keepdim=True)
         weights *= self.route_scale
@@ -682,7 +688,7 @@ class MoE(nn.Module):
             if counts[i] == 0:
                 continue
             expert = self.experts[i]
-            idx, top = torch.where(indices == i)
+            idx, top = torch.where(indices == i) # 返回两个列表，第一个列表是行索引，第二个列表是列索引
             y[idx] += expert(x[idx]) * weights[idx, top, None]
         z = self.shared_experts(x)
         if world_size > 1:
